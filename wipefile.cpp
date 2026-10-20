@@ -39,6 +39,7 @@
 //     wipefile <filename1> [filename2 ...]
 //     wipefile -k <filename1> [filename2 ...]
 //     wipefile -w <options> <filename1> [filename2 ...]
+//     wipefile -n <filename1> [filename2 ...]
 //     wipefile --help | -h | /?
 //
 #include <iostream>
@@ -71,6 +72,7 @@ static void showHelp() {
         "  wipefile <filename1> [filename2 ...]\n"
         "  wipefile -k <filename1> [filename2 ...]\n"
         "  wipefile -w <options> <filename1> [filename2 ...]\n"
+        "  wipefile -n <filename1> [filename2 ...]\n"
         "  wipefile --help | -h | /?\n"
         "\n"
         "Without flags, the entire file is zeroed, renamed to a random string, and deleted.\n"
@@ -78,6 +80,10 @@ static void showHelp() {
         "Global Flags:\n"
         "  -k   Keep the file. Overrides all other deletion logic; the file is neither\n"
         "       renamed nor deleted after the wipe completes.\n"
+        "  -n, --dry-run\n"
+        "       Show what would be done without modifying anything. Each file is still\n"
+        "       opened for read/write to confirm it is accessible, but no bytes are\n"
+        "       written and nothing is renamed or deleted.\n"
         "\n"
         "Standard Options List <beg,end,del> (no spaces allowed, comma separated):\n"
         "  beg  Number of zero bytes to write at the beginning. Use -1 for entire file.\n"
@@ -102,6 +108,8 @@ static void showHelp() {
         "      Zero first 1024 and last 1024 bytes of both files, then delete them.\n"
         "  wipefile -w M40,20 -k text.txt\n"
         "      Zero 20 bytes starting at pos 40, and strictly keep the file.\n"
+        "  wipefile -n *.log\n"
+        "      List what would happen to every matching file without touching them.\n"
         "\n"
         "Exit code is 0 on success, 1 on any error.\n";
 }
@@ -147,7 +155,10 @@ static string generateRandomFilename(size_t length) {
 }
 
 // Overwrite a file with zero bytes, optionally rename it, and optionally delete it.
-static int wipeFilename(const string& filename, int begByteLen, int endByteLen, const vector<MidWipe>& midWipes, bool removeFile) {
+static int wipeFilename(const string& filename, int begByteLen, int endByteLen, const vector<MidWipe>& midWipes, bool removeFile, bool dryRun) {
+    // Prefix for progress messages so dry run output is unmistakable
+    const string tag = dryRun ? "[dry run] " : "";
+
     // Open for in-place binary read/write (does not truncate the file)
     fstream file(filename, ios::in | ios::out | ios::binary);
     if (!file) {
@@ -177,8 +188,10 @@ static int wipeFilename(const string& filename, int begByteLen, int endByteLen, 
             vector<char> zeros(bufferSize, 0);
             
             streamsize wipeSize = std::min(static_cast<streamsize>(bufferSize), fileSize);
-            cout << "Zeroing the beginning " << wipeSize << " bytes..." << endl;
-            file.write(zeros.data(), wipeSize);
+            cout << tag << "Zeroing the beginning " << wipeSize << " bytes..." << endl;
+            if (!dryRun) {
+                file.write(zeros.data(), wipeSize);
+            }
         }
         
         // Zero multiple middle sections
@@ -201,17 +214,19 @@ static int wipeFilename(const string& filename, int begByteLen, int endByteLen, 
             if (currentMidLen > 0 && currentMidPos >= 0) {
                 streamsize maxMidWrite = std::min(static_cast<streamsize>(currentMidLen), fileSize - static_cast<streamsize>(currentMidPos));
                 if (maxMidWrite > 0) {
-                    cout << "Zeroing " << maxMidWrite << " bytes starting at position " << (currentMidPos + 1) << "..." << endl;
-                    file.seekp(currentMidPos, ios::beg);
-                    vector<char> zerosMid(maxMidWrite, 0);
-                    file.write(zerosMid.data(), maxMidWrite);
+                    cout << tag << "Zeroing " << maxMidWrite << " bytes starting at position " << (currentMidPos + 1) << "..." << endl;
+                    if (!dryRun) {
+                        file.seekp(currentMidPos, ios::beg);
+                        vector<char> zerosMid(maxMidWrite, 0);
+                        file.write(zerosMid.data(), maxMidWrite);
+                    }
                 }
             }
         }
 
         // Zero ending
         if (fileSize > begByteLen && endByteLen > 0) {
-            cout << "Zeroing the ending " << endByteLen << " bytes..." << endl;
+            cout << tag << "Zeroing the ending " << endByteLen << " bytes..." << endl;
             const size_t bufferSizeEnd = endByteLen;
             vector<char> zerosEnd(bufferSizeEnd, 0);
             
@@ -219,16 +234,18 @@ static int wipeFilename(const string& filename, int begByteLen, int endByteLen, 
             file.seekp(endPos, ios::beg);
             
             streamsize maxEndWrite = std::min(static_cast<streamsize>(bufferSizeEnd), fileSize - endPos);
-            file.write(zerosEnd.data(), maxEndWrite);
+            if (!dryRun) {
+                file.write(zerosEnd.data(), maxEndWrite);
+            }
         }
     }
     else {
         // Full mode: overwrite the entire file in fixed-size chunks
-        cout << "Zeroing the entire file..." << endl;
+        cout << tag << "Zeroing the entire file (" << fileSize << " bytes)..." << endl;
         const size_t bufferSize = 8192; // 8 KB buffer
         vector<char> buffer(bufferSize, 0);
 
-        streamsize remaining = fileSize;
+        streamsize remaining = dryRun ? 0 : fileSize;
         while (remaining > 0) {
             streamsize chunkSize = std::min(remaining, static_cast<streamsize>(bufferSize));
             file.write(buffer.data(), chunkSize);
@@ -238,6 +255,17 @@ static int wipeFilename(const string& filename, int begByteLen, int endByteLen, 
 
     // Flush and close so the zeroes reach the disk before any rename/delete operations
     file.close();
+
+    if (dryRun) {
+        if (removeFile) {
+            cout << tag << "Renaming to a random name and deleting the file..." << endl;
+        } else {
+            cout << tag << "Keeping the file (not renamed or removed)." << endl;
+        }
+        cout << tag << "No changes made." << endl;
+        return 0;
+    }
+
     cout << "File filled with zeroes successfully." << endl;
 
     if (removeFile) {
@@ -276,6 +304,7 @@ int main(int argc, char* argv[]) {
     // Default behaviors
     bool removeFile = true;
     bool forceKeep = false; // Overrides removeFile if -k is passed
+    bool dryRun = false; // Report actions without modifying any files
     int begByteLen = -1; // -1 means full file wipe
     int endByteLen = 0;
     vector<MidWipe> midWipes;
@@ -295,6 +324,9 @@ int main(int argc, char* argv[]) {
         } 
         else if (arg == "-k") {
             forceKeep = true;
+        }
+        else if (arg == "-n" || arg == "--dry-run") {
+            dryRun = true;
         }
         else if (arg == "-w") {
             if (i + 1 < argc) {
@@ -422,7 +454,7 @@ int main(int argc, char* argv[]) {
         if (filenames.size() > 1) {
             cout << "\nProcessing: " << filenames[i] << endl;
         }
-        int status = wipeFilename(filenames[i], begByteLen, endByteLen, midWipes, removeFile);
+        int status = wipeFilename(filenames[i], begByteLen, endByteLen, midWipes, removeFile, dryRun);
         if (status != 0) {
             overallExitCode = status; // Record failure, but continue wiping
         }
